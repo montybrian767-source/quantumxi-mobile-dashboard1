@@ -1,111 +1,119 @@
 
-import os, sqlite3, hashlib, hmac
-from pathlib import Path
+import hashlib
+import hmac
 from datetime import datetime
+from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-WAREHOUSE_DB = r"D:\QuantumXI_Data\Warehouse\warehouse.db"
-CONSENSUS_CSV = r"D:\QuantumXI_Data\Warehouse\v38_consensus_decision_engine\v38_consensus_rankings.csv"
-PORTAL_DIR = Path(r"D:\QuantumXI_Client_Portal")
-USER_DB = PORTAL_DIR / "portal_users.db"
-
 st.set_page_config(page_title="QuantumXI Investor Portal", page_icon="📈", layout="wide")
 
-def ensure():
-    PORTAL_DIR.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(USER_DB)
-    cur = con.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS users (email TEXT PRIMARY KEY, password_hash TEXT, salt TEXT, role TEXT, created_at TEXT)")
-    cur.execute("CREATE TABLE IF NOT EXISTS watchlists (email TEXT, symbol TEXT, added_at TEXT, PRIMARY KEY(email, symbol))")
-    con.commit()
-    cur.execute("SELECT COUNT(*) FROM users")
-    if cur.fetchone()[0] == 0:
-        salt = "quantumxi_default_salt"
-        pw = hash_pw("admin123", salt)
-        cur.execute("INSERT INTO users VALUES (?,?,?,?,?)", ("admin@quantumxi.local", pw, salt, "admin", datetime.now().isoformat()))
-        con.commit()
-    con.close()
+DEFAULT_ADMIN_EMAIL = "admin@quantumxi.local"
+DEFAULT_ADMIN_PASSWORD = "admin123"
 
-def hash_pw(password, salt):
-    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100000).hex()
+def hash_pw(password):
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
-def login(email, password):
-    con = sqlite3.connect(USER_DB)
-    row = con.execute("SELECT password_hash, salt, role FROM users WHERE email=?", (email.lower().strip(),)).fetchone()
-    con.close()
-    if not row:
+def init_state():
+    if "users" not in st.session_state:
+        st.session_state.users = {
+            DEFAULT_ADMIN_EMAIL: {
+                "password_hash": hash_pw(DEFAULT_ADMIN_PASSWORD),
+                "role": "admin",
+                "created_at": datetime.now().isoformat()
+            }
+        }
+    if "watchlists" not in st.session_state:
+        st.session_state.watchlists = {}
+    if "consensus_df" not in st.session_state:
+        st.session_state.consensus_df = pd.DataFrame()
+
+def authenticate(email, password):
+    email = email.lower().strip()
+    user = st.session_state.users.get(email)
+    if not user:
         return None
-    stored, salt, role = row
-    return role if hmac.compare_digest(stored, hash_pw(password, salt)) else None
+    if hmac.compare_digest(user["password_hash"], hash_pw(password)):
+        return user["role"]
+    return None
 
 def create_user(email, password, role="client"):
     email = email.lower().strip()
     if not email or not password:
         return False, "Email and password required."
-    salt = hashlib.sha256((email + str(datetime.now())).encode()).hexdigest()[:16]
-    try:
-        con = sqlite3.connect(USER_DB)
-        con.execute("INSERT INTO users VALUES (?,?,?,?,?)", (email, hash_pw(password, salt), salt, role, datetime.now().isoformat()))
-        con.commit(); con.close()
-        return True, "Client login created."
-    except sqlite3.IntegrityError:
+    if email in st.session_state.users:
         return False, "User already exists."
+    st.session_state.users[email] = {
+        "password_hash": hash_pw(password),
+        "role": role,
+        "created_at": datetime.now().isoformat()
+    }
+    st.session_state.watchlists.setdefault(email, [])
+    return True, "Client login created."
 
-@st.cache_data(ttl=60)
-def load_consensus():
-    if os.path.exists(CONSENSUS_CSV):
-        df = pd.read_csv(CONSENSUS_CSV)
-        if "symbol" in df.columns:
-            df["symbol"] = df["symbol"].astype(str).str.upper()
-        return df
-    return pd.DataFrame()
-
-@st.cache_data(ttl=300)
-def warehouse_summary():
-    out = {"status":"MISSING","symbols":0,"rows":0,"top_long":"-","top_short":"-"}
-    if not os.path.exists(WAREHOUSE_DB):
-        return out
-    try:
-        con = sqlite3.connect(WAREHOUSE_DB)
-        out["rows"] = con.execute("SELECT COUNT(*) FROM prices").fetchone()[0]
-        out["symbols"] = con.execute("SELECT COUNT(*) FROM alpha_features").fetchone()[0]
-        r = con.execute("SELECT symbol FROM alpha_features ORDER BY long_score DESC LIMIT 1").fetchone()
-        out["top_long"] = r[0] if r else "-"
-        r = con.execute("SELECT symbol FROM alpha_features ORDER BY short_score DESC LIMIT 1").fetchone()
-        out["top_short"] = r[0] if r else "-"
-        con.close()
-        out["status"] = "ONLINE"
-    except Exception as e:
-        out["status"] = "ERROR"
-    return out
-
-def get_watchlist(email):
-    con = sqlite3.connect(USER_DB)
-    df = pd.read_sql_query("SELECT symbol, added_at FROM watchlists WHERE email=? ORDER BY added_at DESC", con, params=(email,))
-    con.close()
+def normalize_columns(df):
+    rename = {}
+    for c in df.columns:
+        key = str(c).lower().strip()
+        if key in ["symbol", "ticker"]:
+            rename[c] = "symbol"
+        elif key in ["decision", "rating"]:
+            rename[c] = "decision"
+        elif key in ["consensus_score", "consensus", "score"]:
+            rename[c] = "consensus_score"
+        elif key in ["live_score", "live"]:
+            rename[c] = "live_score"
+        elif key in ["adaptive_score", "adaptive"]:
+            rename[c] = "adaptive_score"
+        elif key in ["historical_score", "historical"]:
+            rename[c] = "historical_score"
+        elif key in ["risk_score", "risk"]:
+            rename[c] = "risk_score"
+        elif key in ["reason", "note", "notes"]:
+            rename[c] = "reason"
+    df = df.rename(columns=rename)
+    if "symbol" in df.columns:
+        df["symbol"] = df["symbol"].astype(str).str.upper()
+    if "decision" not in df.columns:
+        if "consensus_score" in df.columns:
+            def dec(x):
+                try:
+                    x = float(x)
+                    if x >= 75: return "STRONG BUY"
+                    if x >= 65: return "BUY"
+                    if x >= 50: return "WATCH"
+                    return "AVOID"
+                except Exception:
+                    return "WATCH"
+            df["decision"] = df["consensus_score"].apply(dec)
+        else:
+            df["decision"] = "WATCH"
+    if "reason" not in df.columns:
+        df["reason"] = "QuantumXI consensus output"
     return df
 
-def add_watch(email, symbol):
-    con = sqlite3.connect(USER_DB)
-    con.execute("INSERT OR IGNORE INTO watchlists VALUES (?,?,?)", (email, symbol.upper(), datetime.now().isoformat()))
-    con.commit(); con.close()
-
-def remove_watch(email, symbol):
-    con = sqlite3.connect(USER_DB)
-    con.execute("DELETE FROM watchlists WHERE email=? AND symbol=?", (email, symbol.upper()))
-    con.commit(); con.close()
+def demo_data():
+    return pd.DataFrame([
+        {"symbol":"NVDA","decision":"STRONG BUY","consensus_score":86.4,"live_score":78.2,"adaptive_score":91.5,"historical_score":88.1,"risk_score":63.4,"reason":"adaptive strong, historical strong, live positive"},
+        {"symbol":"PANW","decision":"BUY","consensus_score":73.8,"live_score":66.4,"adaptive_score":82.1,"historical_score":91.2,"risk_score":58.9,"reason":"historical strong, adaptive positive"},
+        {"symbol":"MSFT","decision":"BUY","consensus_score":70.2,"live_score":63.1,"adaptive_score":76.3,"historical_score":80.4,"risk_score":72.7,"reason":"quality and risk profile positive"},
+        {"symbol":"AAPL","decision":"WATCH","consensus_score":58.7,"live_score":54.2,"adaptive_score":62.3,"historical_score":68.2,"risk_score":74.1,"reason":"mixed evidence"},
+        {"symbol":"TSLA","decision":"AVOID","consensus_score":42.9,"live_score":44.1,"adaptive_score":38.7,"historical_score":51.2,"risk_score":29.5,"reason":"higher risk, weak consensus"}
+    ])
 
 def login_screen():
-    st.markdown("<h1 style='text-align:center;font-size:54px;'>QuantumXI</h1><h3 style='text-align:center;color:#22d3ee;'>Investor Portal</h3>", unsafe_allow_html=True)
-    c1,c2,c3 = st.columns([1,1.1,1])
+    st.markdown("<h1 style='text-align:center;font-size:54px;'>QuantumXI</h1>", unsafe_allow_html=True)
+    st.markdown("<h3 style='text-align:center;color:#22d3ee;'>Investor Portal</h3>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align:center;color:#64748b;'>Cloud-ready client dashboard</p>", unsafe_allow_html=True)
+
+    c1, c2, c3 = st.columns([1, 1.2, 1])
     with c2:
         with st.container(border=True):
             st.subheader("Client Login")
-            email = st.text_input("Email", value="admin@quantumxi.local")
-            pw = st.text_input("Password", type="password", value="admin123")
+            email = st.text_input("Email", value=DEFAULT_ADMIN_EMAIL)
+            password = st.text_input("Password", type="password", value=DEFAULT_ADMIN_PASSWORD)
             if st.button("Login", use_container_width=True):
-                role = login(email, pw)
+                role = authenticate(email, password)
                 if role:
                     st.session_state.logged_in = True
                     st.session_state.email = email.lower().strip()
@@ -113,87 +121,92 @@ def login_screen():
                     st.rerun()
                 else:
                     st.error("Invalid login.")
-            st.caption("Default demo login: admin@quantumxi.local / admin123")
+            st.caption("Demo login: admin@quantumxi.local / admin123")
 
-def dashboard():
-    email = st.session_state.email
-    role = st.session_state.role
-    df = load_consensus()
-    summary = warehouse_summary()
-
+def sidebar():
     st.sidebar.title("QuantumXI")
-    st.sidebar.caption(f"User: {email}")
-    st.sidebar.caption(f"Role: {role}")
-    page = st.sidebar.radio("Menu", ["Dashboard","Top Ideas","My Watchlist","Reports","Admin"])
+    st.sidebar.caption(f"User: {st.session_state.email}")
+    st.sidebar.caption(f"Role: {st.session_state.role}")
+    page = st.sidebar.radio("Menu", ["Dashboard", "Top Ideas", "My Watchlist", "Reports", "Admin"])
     if st.sidebar.button("Logout"):
-        st.session_state.clear(); st.rerun()
+        for k in ["logged_in", "email", "role"]:
+            if k in st.session_state:
+                del st.session_state[k]
+        st.rerun()
+    return page
 
-    if page == "Dashboard":
-        st.title("Investor Dashboard")
-        a,b,c,d = st.columns(4)
-        a.metric("Warehouse", summary["status"])
-        b.metric("Symbols", f"{summary['symbols']:,}")
-        c.metric("Price Rows", f"{summary['rows']:,}")
-        d.metric("Consensus Rows", f"{len(df):,}")
+def get_df():
+    df = st.session_state.consensus_df
+    if df.empty:
+        return demo_data()
+    return df
 
-        if df.empty:
-            st.warning("No v38 consensus rankings found. Run v38 first.")
-            st.code(CONSENSUS_CSV)
-            return
+def dashboard_page():
+    df = get_df()
+    st.title("Investor Dashboard")
 
-        st.subheader("Top Consensus Idea")
-        top = df.iloc[0]
-        x1,x2,x3,x4 = st.columns(4)
-        x1.metric("Symbol", top.get("symbol","-"))
-        x2.metric("Decision", top.get("decision","-"))
-        x3.metric("Consensus", f"{float(top.get('consensus_score',0)):.2f}")
-        x4.metric("Reason", str(top.get("reason","-"))[:30])
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Portal Status", "ONLINE")
+    c2.metric("Consensus Rows", f"{len(df):,}")
+    c3.metric("Strong Buy", int((df["decision"] == "STRONG BUY").sum()) if "decision" in df else 0)
+    c4.metric("Buy", int((df["decision"] == "BUY").sum()) if "decision" in df else 0)
 
-        cols = [c for c in ["symbol","decision","consensus_score","live_score","adaptive_score","historical_score","risk_score","reason"] if c in df.columns]
-        st.dataframe(df[cols].head(10), use_container_width=True, hide_index=True)
-        st.info("Decision-support only. Not financial advice.")
+    st.divider()
 
-    elif page == "Top Ideas":
-        st.title("Top Ideas")
-        if df.empty:
-            st.warning("Run v38 first.")
-            return
-        choices = ["STRONG BUY","BUY","WATCH","AVOID"]
-        selected = st.multiselect("Decision Filter", choices, default=["STRONG BUY","BUY"])
-        view = df[df["decision"].isin(selected)] if "decision" in df.columns else df
-        st.dataframe(view.head(100), use_container_width=True, hide_index=True)
-        sym = st.text_input("Add Symbol to Watchlist").upper()
-        if st.button("Add") and sym:
-            add_watch(email, sym); st.success(f"{sym} added.")
+    top = df.iloc[0]
+    st.subheader("Top Consensus Idea")
+    a, b, c, d = st.columns(4)
+    a.metric("Symbol", top.get("symbol", "-"))
+    b.metric("Decision", top.get("decision", "-"))
+    c.metric("Consensus", f"{float(top.get('consensus_score', 0)):.2f}")
+    d.metric("Reason", str(top.get("reason", "-"))[:30])
 
-    elif page == "My Watchlist":
-        st.title("My Watchlist")
-        wl = get_watchlist(email)
-        if wl.empty:
-            st.info("No watchlist symbols yet.")
-        else:
-            if not df.empty:
-                merged = wl.merge(df, on="symbol", how="left")
-                cols = [c for c in ["symbol","decision","consensus_score","live_score","adaptive_score","historical_score","risk_score","reason"] if c in merged.columns]
-                st.dataframe(merged[cols], use_container_width=True, hide_index=True)
-            else:
-                st.dataframe(wl, use_container_width=True, hide_index=True)
-        rem = st.text_input("Remove Symbol").upper()
-        if st.button("Remove") and rem:
-            remove_watch(email, rem); st.rerun()
+    st.subheader("Top 10 Ideas")
+    cols = [x for x in ["symbol","decision","consensus_score","live_score","adaptive_score","historical_score","risk_score","reason"] if x in df.columns]
+    st.dataframe(df[cols].head(10), use_container_width=True, hide_index=True)
+    st.info("Research and decision-support only. Not financial advice.")
 
-    elif page == "Reports":
-        st.title("Research Reports")
-        if df.empty:
-            st.warning("No consensus data.")
-            return
-        symbol = st.selectbox("Symbol", df["symbol"].head(100).tolist())
-        row = df[df["symbol"] == symbol].iloc[0]
-        st.subheader(f"{symbol} Snapshot")
-        st.write(f"**Decision:** {row.get('decision','-')}")
-        st.write(f"**Consensus Score:** {row.get('consensus_score','-')}")
-        st.write(f"**Reason:** {row.get('reason','-')}")
-        report = f"""QUANTUMXI RESEARCH SNAPSHOT
+def top_ideas_page():
+    df = get_df()
+    st.title("Top Ideas")
+    selected = st.multiselect("Decision Filter", ["STRONG BUY","BUY","WATCH","AVOID"], default=["STRONG BUY","BUY"])
+    view = df[df["decision"].isin(selected)] if "decision" in df.columns else df
+    st.dataframe(view, use_container_width=True, hide_index=True)
+
+    sym = st.text_input("Add symbol to watchlist").upper()
+    if st.button("Add to Watchlist") and sym:
+        wl = st.session_state.watchlists.setdefault(st.session_state.email, [])
+        if sym not in wl:
+            wl.append(sym)
+        st.success(f"{sym} added.")
+
+def watchlist_page():
+    df = get_df()
+    st.title("My Watchlist")
+    wl = st.session_state.watchlists.setdefault(st.session_state.email, [])
+    if not wl:
+        st.info("No symbols added yet.")
+        return
+    view = df[df["symbol"].isin(wl)] if "symbol" in df.columns else pd.DataFrame({"symbol": wl})
+    st.dataframe(view, use_container_width=True, hide_index=True)
+
+    rem = st.text_input("Remove symbol").upper()
+    if st.button("Remove") and rem in wl:
+        wl.remove(rem)
+        st.rerun()
+
+def reports_page():
+    df = get_df()
+    st.title("Research Reports")
+    symbol = st.selectbox("Choose symbol", df["symbol"].tolist())
+    row = df[df["symbol"] == symbol].iloc[0]
+
+    st.subheader(f"{symbol} Research Snapshot")
+    st.write(f"**Decision:** {row.get('decision','-')}")
+    st.write(f"**Consensus Score:** {row.get('consensus_score','-')}")
+    st.write(f"**Reason:** {row.get('reason','-')}")
+
+    report = f"""QUANTUMXI RESEARCH SNAPSHOT
 
 Symbol: {symbol}
 Decision: {row.get('decision','-')}
@@ -209,32 +222,54 @@ Reason:
 Disclaimer:
 Research and decision-support software only. Not financial advice.
 """
-        st.download_button("Download Report", report, file_name=f"{symbol}_QuantumXI_Report.txt")
+    st.download_button("Download Report", report, file_name=f"{symbol}_QuantumXI_Report.txt")
 
-    elif page == "Admin":
-        st.title("Admin")
-        if role != "admin":
-            st.error("Admin only.")
-            return
-        st.subheader("Create Client Login")
-        new_email = st.text_input("Client email")
-        new_pw = st.text_input("Temporary password", type="password")
-        if st.button("Create Client"):
-            ok,msg = create_user(new_email,new_pw)
-            st.success(msg) if ok else st.error(msg)
-        st.subheader("System Paths")
-        st.code(f"Warehouse: {WAREHOUSE_DB}")
-        st.code(f"Consensus CSV: {CONSENSUS_CSV}")
-        st.code(f"User DB: {USER_DB}")
-        if st.button("Reload Data"):
-            st.cache_data.clear(); st.rerun()
+def admin_page():
+    st.title("Admin")
+    if st.session_state.role != "admin":
+        st.error("Admin only.")
+        return
+
+    st.subheader("Upload v38 Consensus CSV")
+    uploaded = st.file_uploader("Upload v38_consensus_rankings.csv", type=["csv"])
+    if uploaded:
+        df = pd.read_csv(uploaded)
+        df = normalize_columns(df)
+        st.session_state.consensus_df = df
+        st.success(f"Loaded {len(df)} consensus rows.")
+        st.dataframe(df.head(20), use_container_width=True, hide_index=True)
+
+    st.subheader("Create client login")
+    email = st.text_input("Client email")
+    pw = st.text_input("Temporary password", type="password")
+    if st.button("Create Client"):
+        ok, msg = create_user(email, pw)
+        st.success(msg) if ok else st.error(msg)
+
+    st.subheader("Current users")
+    st.dataframe(pd.DataFrame([
+        {"email": k, "role": v["role"], "created_at": v["created_at"]}
+        for k, v in st.session_state.users.items()
+    ]), use_container_width=True, hide_index=True)
+
+    st.caption("Cloud demo note: users and uploaded data are session-based in this version. Production version should use Supabase/Postgres.")
 
 def main():
-    ensure()
+    init_state()
     if not st.session_state.get("logged_in"):
         login_screen()
-    else:
-        dashboard()
+        return
+    page = sidebar()
+    if page == "Dashboard":
+        dashboard_page()
+    elif page == "Top Ideas":
+        top_ideas_page()
+    elif page == "My Watchlist":
+        watchlist_page()
+    elif page == "Reports":
+        reports_page()
+    elif page == "Admin":
+        admin_page()
 
 if __name__ == "__main__":
     main()
